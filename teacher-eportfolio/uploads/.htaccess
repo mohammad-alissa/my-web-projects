@@ -1,4 +1,5 @@
 # مجلد الملفات المرفوعة: عرض الملفات فقط ومنع تشغيل أي سكربت
+# (ملفات .part أجزاء رفع لم يكتمل بعد، ولا تُعرض)
 Options -Indexes -ExecCGI
 RemoveHandler .php .phtml .php3 .php4 .php5 .php7 .php8 .phar .phps .cgi .pl .py .sh
 RemoveType .php .phtml .php3 .php4 .php5 .php7 .php8 .phar .phps
@@ -10,7 +11,7 @@ RemoveType .php .phtml .php3 .php4 .php5 .php7 .php8 .phar .phps
   php_flag engine off
 </IfModule>
 
-<FilesMatch "\.(php\d?|phtml|phar|phps|cgi|pl|py|sh|htaccess)$">
+<FilesMatch "\.(php\d?|phtml|phar|phps|cgi|pl|py|sh|htaccess|part)$">
   <IfModule mod_authz_core.c>
     Require all denied
   </IfModule>

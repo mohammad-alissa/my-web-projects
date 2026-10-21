@@ -1561,6 +1561,12 @@ const canEdit = () => isAdmin && !previewMode;
 
 const blobToDataURL = (blob) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob); });
 
+function bytesToBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
 // شرح سبب الرد غير المفهوم من الاستضافة بدل رسالة عامة
 function explainBadResponse(status, text) {
   const t = String(text || '');
@@ -1597,12 +1603,18 @@ const serverBackend = {
   save(k, v) { return this.call('save', { json: { key: k, value: v } }); },
   remove(k) { return this.call('delete', { json: { key: k } }); },
   saveMany(items) { return this.call('save_many', { json: { items } }); },
+  // يُرسل الملف على أجزاء نصية صغيرة (Base64): جدار الحماية في الاستضافة المجانية
+  // يرفض أحياناً الصور الخام (403)، والأجزاء الصغيرة لا تتجاوز حد حجم الطلب
   async upload(blob, name) {
-    const form = new FormData();
-    // اسم إنجليزي بسيط: بعض جدران الحماية ترفض أسماء الملفات العربية، والخادم يولّد اسماً جديداً أصلاً
     const ext = (/\.([a-z0-9]{1,5})$/i.exec(name || '') || [, 'bin'])[1].toLowerCase();
-    form.append('file', blob, 'upload.' + ext);
-    return (await this.call('upload', { form })).url;
+    const id = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const CHUNK = 64 * 1024;
+    for (let offset = 0; ; offset += CHUNK) {
+      const last = offset + CHUNK >= bytes.length;
+      const res = await this.call('upload_chunk', { json: { id, ext, offset, last, data: bytesToBase64(bytes.subarray(offset, offset + CHUNK)) } });
+      if (last) return res.url;
+    }
   },
   deleteFile(url) { return this.call('delete_file', { json: { url } }).catch(() => {}); },
   async login(username, password) { const d = await this.call('login', { json: { username, password } }); csrf = d.csrf; isAdmin = true; adminUser = username; },

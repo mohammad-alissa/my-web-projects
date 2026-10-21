@@ -259,6 +259,12 @@ function upload_limit_mb(): int
     return max(1, (int)floor($bytes / 1048576));
 }
 
+function ensure_upload_dir(): void
+{
+    if (!is_dir(UPLOAD_DIR) && !@mkdir(UPLOAD_DIR, 0755, true)) fail('تعذر إنشاء مجلد uploads على الخادم', 500);
+    if (!is_writable(UPLOAD_DIR)) fail('مجلد uploads غير قابل للكتابة — اجعل صلاحياته 755 من مدير الملفات', 500);
+}
+
 function body(): array
 {
     $json = json_decode(file_get_contents('php://input') ?: '', true);
@@ -593,7 +599,7 @@ try {
                 'admin'       => is_admin(),
                 'csrf'        => is_admin() ? $_SESSION['csrf'] : null,
                 'adminUser'   => is_admin() ? admin_credentials()['user'] : null,
-                'maxUploadMb' => upload_limit_mb(),
+                'maxUploadMb' => MAX_UPLOAD_MB,
             ]);
 
         // تسجيل دخول المسؤول
@@ -663,7 +669,43 @@ try {
             in_transaction(fn() => save_key($key, null));
             out(['ok' => true]);
 
-        // رفع ملف (صورة / Word / PDF)
+        // رفع ملف على أجزاء نصية صغيرة (Base64 داخل JSON)
+        // جدار الحماية في بعض الاستضافات المجانية يفحص بايتات الصور الخام ويرفض بعضها خطأً (403)،
+        // والأجزاء النصية الصغيرة لا تثير هذا الفحص ولا تتجاوز حد حجم الطلب.
+        case 'upload_chunk':
+            require_admin();
+            $b = body();
+            $id = (string)($b['id'] ?? '');
+            if (preg_match('/^[a-f0-9]{32}$/', $id) !== 1) fail('طلب غير صالح');
+            $ext = strtolower((string)($b['ext'] ?? ''));
+            if (!isset(ALLOWED_UPLOADS[$ext])) fail('نوع الملف غير مسموح (المسموح: الصور، Word، PDF)');
+            $offset = $b['offset'] ?? null;
+            if (!is_int($offset) || $offset < 0) fail('طلب غير صالح');
+            $data = base64_decode((string)($b['data'] ?? ''), true);
+            if ($data === false || $data === '' || strlen($data) > 262144) fail('بيانات الملف تالفة — أعد المحاولة');
+
+            ensure_upload_dir();
+            $part = UPLOAD_DIR . '/' . $id . '.part';
+            if ($offset === 0) {
+                foreach (glob(UPLOAD_DIR . '/*.part') ?: [] as $old) {
+                    if (@filemtime($old) < time() - 3600) @unlink($old);   // بقايا رفع لم يكتمل
+                }
+                @unlink($part);
+            }
+            clearstatcache(true, $part);
+            $size = is_file($part) ? (int)filesize($part) : 0;
+            if ($offset !== $size) fail('انقطع الرفع — أعد المحاولة', 409);
+            if ($size + strlen($data) > MAX_UPLOAD_MB * 1048576) { @unlink($part); fail('الملف أكبر من ' . MAX_UPLOAD_MB . ' ميجابايت'); }
+            if (@file_put_contents($part, $data, FILE_APPEND | LOCK_EX) === false) fail('تعذر حفظ الملف على الخادم', 500);
+            if (empty($b['last'])) out(['ok' => true, 'received' => $size + strlen($data)]);
+
+            if (!in_array(detect_mime($part), ALLOWED_UPLOADS[$ext], true)) { @unlink($part); fail('محتوى الملف لا يطابق امتداده'); }
+            $name = bin2hex(random_bytes(16)) . '.' . $ext;
+            if (!@rename($part, UPLOAD_DIR . '/' . $name)) { @unlink($part); fail('تعذر حفظ الملف على الخادم', 500); }
+            @chmod(UPLOAD_DIR . '/' . $name, 0644);
+            out(['ok' => true, 'url' => 'uploads/' . $name, 'size' => (int)filesize(UPLOAD_DIR . '/' . $name)]);
+
+        // رفع ملف (صورة / Word / PDF) دفعة واحدة — بديل قديم
         case 'upload':
             require_admin();
             $file = $_FILES['file'] ?? null;
@@ -680,8 +722,7 @@ try {
             $mime = detect_mime($file['tmp_name']);
             if (!in_array($mime, ALLOWED_UPLOADS[$ext], true)) fail('محتوى الملف لا يطابق امتداده');
 
-            if (!is_dir(UPLOAD_DIR) && !@mkdir(UPLOAD_DIR, 0755, true)) fail('تعذر إنشاء مجلد uploads على الخادم', 500);
-            if (!is_writable(UPLOAD_DIR)) fail('مجلد uploads غير قابل للكتابة — اجعل صلاحياته 755 من مدير الملفات', 500);
+            ensure_upload_dir();
             $name = bin2hex(random_bytes(16)) . '.' . $ext;
             if (!@move_uploaded_file($file['tmp_name'], UPLOAD_DIR . '/' . $name)) fail('تعذر حفظ الملف على الخادم — تحقق من صلاحيات مجلد uploads', 500);
             @chmod(UPLOAD_DIR . '/' . $name, 0644);
