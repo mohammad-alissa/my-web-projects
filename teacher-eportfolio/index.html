@@ -1561,6 +1561,17 @@ const canEdit = () => isAdmin && !previewMode;
 
 const blobToDataURL = (blob) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob); });
 
+// شرح سبب الرد غير المفهوم من الاستضافة بدل رسالة عامة
+function explainBadResponse(status, text) {
+  const t = String(text || '');
+  if (/aes\.js|slowAES|__test=|toNumbers\(/i.test(t)) return 'انتهت صلاحية فحص الحماية في الاستضافة — حدّث الصفحة ثم أعد المحاولة';
+  if (status === 413) return 'الملف أكبر من الحد المسموح في الاستضافة';
+  if (status === 403) return 'رفضت الاستضافة الطلب (جدار الحماية) — جرّب ملفاً آخر أو أعد تسمية الملف';
+  if (status === 429 || status === 503 || status === 508) return 'الاستضافة مشغولة أو تجاوزت حد الاستخدام مؤقتاً — جرّب بعد دقائق';
+  const snippet = t.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 90);
+  return `استجابة غير صالحة من الخادم (رمز ${status})` + (snippet ? `: ${snippet}` : '');
+}
+
 const serverBackend = {
   kind: 'server',
   async call(action, { method = 'POST', json, form } = {}) {
@@ -1568,9 +1579,13 @@ const serverBackend = {
     if (csrf) opts.headers['X-CSRF-Token'] = csrf;
     if (json !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(json); }
     if (form) opts.body = form;
-    const res = await fetch(`${API_URL}?action=${action}`, opts);
+    let res;
+    try { res = await fetch(`${API_URL}?action=${action}`, opts); }
+    catch { throw new Error('تعذر الاتصال بالخادم — تحقق من الإنترنت وأعد المحاولة'); }
+    const text = await res.text();
     let data;
-    try { data = await res.json(); } catch { const e = new Error('استجابة غير صالحة من الخادم'); e.noServer = true; throw e; }
+    try { data = JSON.parse(text); }
+    catch { const e = new Error(explainBadResponse(res.status, text)); e.noServer = true; throw e; }
     if (!res.ok || !data.ok) throw new Error(data.error || 'حدث خطأ في الخادم');
     return data;
   },
@@ -1584,7 +1599,9 @@ const serverBackend = {
   saveMany(items) { return this.call('save_many', { json: { items } }); },
   async upload(blob, name) {
     const form = new FormData();
-    form.append('file', blob, name);
+    // اسم إنجليزي بسيط: بعض جدران الحماية ترفض أسماء الملفات العربية، والخادم يولّد اسماً جديداً أصلاً
+    const ext = (/\.([a-z0-9]{1,5})$/i.exec(name || '') || [, 'bin'])[1].toLowerCase();
+    form.append('file', blob, 'upload.' + ext);
     return (await this.call('upload', { form })).url;
   },
   deleteFile(url) { return this.call('delete_file', { json: { url } }).catch(() => {}); },

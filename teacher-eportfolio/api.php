@@ -9,6 +9,19 @@ declare(strict_types=1);
 
 require __DIR__ . '/config.php';
 
+// أي تحذير أو خطأ من PHP لا يُطبع داخل الرد؛ الرد دائماً JSON سليم
+ini_set('display_errors', '0');
+ob_start();
+register_shutdown_function(function () {
+    $e = error_get_last();
+    if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        while (ob_get_level()) ob_end_clean();
+        if (!headers_sent()) { http_response_code(500); header('Content-Type: application/json; charset=utf-8'); }
+        error_log('eportfolio fatal: ' . $e['message']);
+        echo json_encode(['ok' => false, 'error' => 'خطأ في الخادم — جرّب مرة أخرى'], JSON_UNESCAPED_UNICODE);
+    }
+});
+
 header('Content-Type: application/json; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
 header('Cache-Control: no-store');
@@ -71,6 +84,7 @@ const KEY_ORDER = ['settings', 'cv', 'growth', 'certs', 'folders', 'avatar', 'lo
 /* ---------- أدوات مساعدة ---------- */
 function out(array $data, int $code = 200): void
 {
+    while (ob_get_level()) ob_end_clean();   // تجاهل أي تحذير طُبع قبل الرد
     http_response_code($code);
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
@@ -215,6 +229,34 @@ function ordered_keys(array $keys): array
 function is_admin(): bool
 {
     return !empty($_SESSION['admin']);
+}
+
+// نوع الملف الفعلي من محتواه (مع بديل إن كانت إضافة fileinfo معطلة في الاستضافة)
+function detect_mime(string $path): string
+{
+    if (class_exists('finfo')) return (new finfo(FILEINFO_MIME_TYPE))->file($path) ?: '';
+    if (function_exists('mime_content_type')) return mime_content_type($path) ?: '';
+    $img = @getimagesize($path);
+    if ($img && !empty($img['mime'])) return $img['mime'];
+    $head = (string)@file_get_contents($path, false, null, 0, 8);
+    if (strncmp($head, '%PDF', 4) === 0) return 'application/pdf';
+    if (strncmp($head, "PK\x03\x04", 4) === 0) return 'application/zip';
+    if (strncmp($head, "\xD0\xCF\x11\xE0", 4) === 0) return 'application/x-ole-storage';
+    return 'application/octet-stream';
+}
+
+// الحد الفعلي للرفع: الأصغر بين إعداد الموقع وحدود PHP في الاستضافة
+function ini_bytes(string $key): int
+{
+    $v = trim((string)ini_get($key));
+    if ($v === '' || $v === '-1' || $v === '0') return PHP_INT_MAX;
+    $n = (int)$v; $u = strtolower(substr($v, -1));
+    return $u === 'g' ? $n * 1073741824 : ($u === 'm' ? $n * 1048576 : ($u === 'k' ? $n * 1024 : $n));
+}
+function upload_limit_mb(): int
+{
+    $bytes = min(MAX_UPLOAD_MB * 1048576, ini_bytes('upload_max_filesize'), ini_bytes('post_max_size'));
+    return max(1, (int)floor($bytes / 1048576));
 }
 
 function body(): array
@@ -551,7 +593,7 @@ try {
                 'admin'       => is_admin(),
                 'csrf'        => is_admin() ? $_SESSION['csrf'] : null,
                 'adminUser'   => is_admin() ? admin_credentials()['user'] : null,
-                'maxUploadMb' => MAX_UPLOAD_MB,
+                'maxUploadMb' => upload_limit_mb(),
             ]);
 
         // تسجيل دخول المسؤول
@@ -625,19 +667,23 @@ try {
         case 'upload':
             require_admin();
             $file = $_FILES['file'] ?? null;
+            if (!$file && (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > ini_bytes('post_max_size')) {
+                fail('الملف أكبر من الحد المسموح في الاستضافة (' . upload_limit_mb() . ' ميجابايت)');
+            }
             if (!$file || !is_array($file) || is_array($file['error'])) fail('لم يُرسل أي ملف');
             if ($file['error'] === UPLOAD_ERR_INI_SIZE || $file['error'] === UPLOAD_ERR_FORM_SIZE) fail('الملف أكبر من الحد المسموح في إعدادات الاستضافة');
             if ($file['error'] !== UPLOAD_ERR_OK) fail('فشل رفع الملف (رمز ' . (int)$file['error'] . ')');
-            if ($file['size'] > MAX_UPLOAD_MB * 1024 * 1024) fail('الملف أكبر من ' . MAX_UPLOAD_MB . ' ميجابايت');
+            if ($file['size'] > upload_limit_mb() * 1048576) fail('الملف أكبر من ' . upload_limit_mb() . ' ميجابايت');
 
             $ext = strtolower(pathinfo((string)$file['name'], PATHINFO_EXTENSION));
             if (!isset(ALLOWED_UPLOADS[$ext])) fail('نوع الملف غير مسموح (المسموح: الصور، Word، PDF)');
-            $mime = (new finfo(FILEINFO_MIME_TYPE))->file($file['tmp_name']) ?: '';
+            $mime = detect_mime($file['tmp_name']);
             if (!in_array($mime, ALLOWED_UPLOADS[$ext], true)) fail('محتوى الملف لا يطابق امتداده');
 
-            if (!is_dir(UPLOAD_DIR) && !mkdir(UPLOAD_DIR, 0755, true)) fail('تعذر إنشاء مجلد الرفع', 500);
+            if (!is_dir(UPLOAD_DIR) && !@mkdir(UPLOAD_DIR, 0755, true)) fail('تعذر إنشاء مجلد uploads على الخادم', 500);
+            if (!is_writable(UPLOAD_DIR)) fail('مجلد uploads غير قابل للكتابة — اجعل صلاحياته 755 من مدير الملفات', 500);
             $name = bin2hex(random_bytes(16)) . '.' . $ext;
-            if (!move_uploaded_file($file['tmp_name'], UPLOAD_DIR . '/' . $name)) fail('تعذر حفظ الملف على الخادم — تحقق من صلاحيات مجلد uploads', 500);
+            if (!@move_uploaded_file($file['tmp_name'], UPLOAD_DIR . '/' . $name)) fail('تعذر حفظ الملف على الخادم — تحقق من صلاحيات مجلد uploads', 500);
             @chmod(UPLOAD_DIR . '/' . $name, 0644);
             out(['ok' => true, 'url' => 'uploads/' . $name, 'size' => (int)$file['size']]);
 
@@ -697,7 +743,6 @@ try {
 
             // استخراج الملفات المسموحة فقط (بأسمائها العشوائية) مع التحقق من نوعها
             if (!is_dir(UPLOAD_DIR)) @mkdir(UPLOAD_DIR, 0755, true);
-            $finfo = new finfo(FILEINFO_MIME_TYPE);
             for ($i = 0; $i < $zip->numFiles; $i++) {
                 $stat = $zip->statIndex($i);
                 if (!$stat || !preg_match('#^uploads/([a-f0-9]{32}\.([a-z]+))$#', $stat['name'], $m)) continue;
@@ -708,7 +753,7 @@ try {
                 $outFile = fopen($dest, 'wb');
                 stream_copy_to_stream($in, $outFile, MAX_UPLOAD_MB * 1024 * 1024);
                 fclose($in); fclose($outFile);
-                if (!in_array($finfo->file($dest) ?: '', ALLOWED_UPLOADS[$m[2]] ?? [], true)) @unlink($dest);
+                if (!in_array(detect_mime($dest), ALLOWED_UPLOADS[$m[2]] ?? [], true)) @unlink($dest);
                 else @chmod($dest, 0644);
             }
             $zip->close();
@@ -747,4 +792,7 @@ try {
 } catch (PDOException $e) {
     error_log('eportfolio: ' . $e->getMessage());
     fail('حدث خطأ في قاعدة البيانات', 500);
+} catch (Throwable $e) {
+    error_log('eportfolio: ' . $e->getMessage());
+    fail(is_admin() ? 'خطأ في الخادم: ' . $e->getMessage() : 'خطأ في الخادم', 500);
 }
