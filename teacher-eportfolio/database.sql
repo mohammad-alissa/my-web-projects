@@ -204,8 +204,7 @@ SELECT * FROM (
   SELECT 'analysis', 'الاختبارات التشخيصية (القبلية)', 1 UNION ALL
   SELECT 'analysis', 'تحليل نتائج الاختبارات', 2 UNION ALL
   SELECT 'analysis', 'تصنيف الطلاب حسب المستويات', 3 UNION ALL
-  SELECT 'analysis', 'تحليل نتائج الاختبارات الوطنية (نافس)', 4 UNION ALL
-  SELECT 'analysis', 'خطط مبنية على نتائج التحليل', 5 UNION ALL
+  SELECT 'analysis', 'خطط مبنية على نتائج التحليل', 4 UNION ALL
   SELECT 'assessment', 'التقويم القبلي والتكويني والختامي', 1 UNION ALL
   SELECT 'assessment', 'الاختبارات القصيرة والمراجعات', 2 UNION ALL
   SELECT 'assessment', 'سلالم التقدير وقوائم الرصد', 3 UNION ALL
