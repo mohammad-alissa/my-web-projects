@@ -259,6 +259,133 @@ function upload_limit_mb(): int
     return max(1, (int)floor($bytes / 1048576));
 }
 
+/* =====================================================================
+   الربط مع منصة المعلمة
+   يجلب الخادم شواهد المنصة بنفسه (فيبقى مفتاح الربط سراً لا يصل للمتصفح)،
+   ويحفظ نسخة مؤقتة لعشر دقائق حتى لا يُثقل على الاستضافة.
+   ===================================================================== */
+const PLATFORM_CACHE_SECONDS = 600;
+const PLATFORM_STANDARDS = ['classroom', 'planning', 'results', 'parents', 'tech', 'environment', 'assessment', 'analysis'];
+
+function get_setting(string $key): ?string
+{
+    $stmt = db()->prepare('SELECT setting_value FROM ep_settings WHERE setting_key = ?');
+    $stmt->execute([$key]);
+    $v = $stmt->fetchColumn();
+    return $v === false ? null : (string)$v;
+}
+
+function del_settings(array $keys): void
+{
+    db()->prepare('DELETE FROM ep_settings WHERE setting_key IN (' . implode(',', array_fill(0, count($keys), '?')) . ')')->execute($keys);
+}
+
+// طلب GET بسيط (curl إن توفر، وإلا file_get_contents)
+function http_get(string $url, array $headers): array
+{
+    $headers[] = 'Accept: application/json';
+    $agent = 'Mozilla/5.0 (eportfolio-sync)';
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => true, CURLOPT_MAXREDIRS => 3,
+            CURLOPT_CONNECTTIMEOUT => 6, CURLOPT_TIMEOUT => 15, CURLOPT_HTTPHEADER => $headers, CURLOPT_USERAGENT => $agent,
+        ]);
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        curl_close($ch);
+        if ($body === false) throw new RuntimeException('تعذر الاتصال بمنصة المعلمة' . ($err ? " ($err)" : ''));
+        return [$code, (string)$body];
+    }
+    if (!ini_get('allow_url_fopen')) throw new RuntimeException('الاستضافة لا تسمح بالاتصال بمواقع أخرى (curl غير متاح)');
+    $ctx = stream_context_create(['http' => ['method' => 'GET', 'header' => implode("\r\n", $headers), 'user_agent' => $agent, 'timeout' => 15, 'ignore_errors' => true]]);
+    $body = @file_get_contents($url, false, $ctx);
+    if ($body === false) throw new RuntimeException('تعذر الاتصال بمنصة المعلمة');
+    $code = 0;
+    foreach ($http_response_header ?? [] as $h) if (preg_match('#^HTTP/\S+\s+(\d{3})#', $h, $m)) $code = (int)$m[1];
+    return [$code, (string)$body];
+}
+
+// قراءة تغذية ملف الإنجاز من المنصة (مع اجتياز فحص الحماية في InfinityFree إن ظهر)
+function platform_fetch(string $base, string $key): array
+{
+    $url = $base . '/api.php?action=portfolio';
+    $headers = ['X-Portfolio-Key: ' . $key];
+    [$code, $body] = http_get($url, $headers);
+    $json = json_decode($body, true);
+
+    // صفحة الحماية: toNumbers("المفتاح") toNumbers("المتجه") toNumbers("النص المشفر") ← كوكي __test
+    if (!is_array($json) && preg_match_all('/toNumbers\("([0-9a-f]+)"\)/i', $body, $m) && count($m[1]) >= 3) {
+        if (!function_exists('openssl_decrypt')) throw new RuntimeException('فحص الحماية في الاستضافة يمنع الاتصال (openssl غير متاح)');
+        $plain = openssl_decrypt(hex2bin($m[1][2]), 'AES-128-CBC', hex2bin($m[1][0]), OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING, hex2bin($m[1][1]));
+        if ($plain === false) throw new RuntimeException('تعذر اجتياز فحص الحماية في استضافة المنصة');
+        $headers[] = 'Cookie: __test=' . bin2hex($plain);
+        [$code, $body] = http_get($url . '&i=1', $headers);
+        $json = json_decode($body, true);
+    }
+
+    if (!is_array($json)) throw new RuntimeException("رد غير مفهوم من منصة المعلمة (رمز $code) — تأكد من الرابط");
+    $err = $json['error'] ?? null;
+    if ($err === 'portfolio_key') throw new RuntimeException('مفتاح الربط غير صحيح، أو PORTFOLIO_KEY غير مضبوط في config.php بالمنصة');
+    if ($err) throw new RuntimeException('خطأ من منصة المعلمة: ' . (is_string($err) ? $err : json_encode($err)));
+    if (!is_array($json['data'] ?? null)) throw new RuntimeException('منصة المعلمة لم ترسل بيانات');
+    return $json['data'];
+}
+
+function http_url($v): ?string
+{
+    return (is_string($v) && strlen($v) < 2000 && preg_match('#^https?://[^\s<>"\']+$#i', $v)) ? $v : null;
+}
+
+// إبقاء الحقول المعروفة فقط مما يأتي من المنصة
+function platform_shape(array $d): array
+{
+    $str = fn($v, int $n = 255) => is_scalar($v) ? clip($v, $n) : '';
+    $out = ['teacher_name' => $str($d['teacher_name'] ?? ''), 'generated_at' => $str($d['generated_at'] ?? '', 40), 'summary' => [], 'standards' => []];
+    foreach ((array)($d['summary'] ?? []) as $k => $v) if (is_string($k) && (is_int($v) || is_float($v) || $v === null)) $out['summary'][$k] = $v;
+    foreach ((array)($d['standards'] ?? []) as $s) {
+        if (!is_array($s) || !in_array($s['key'] ?? '', PLATFORM_STANDARDS, true)) continue;
+        $std = ['key' => $s['key'], 'title' => $str($s['title_ar'] ?? ''), 'items' => [], 'stats' => [], 'cards' => []];
+        foreach (array_slice((array)($s['items'] ?? []), 0, 40) as $it) {
+            if (!is_array($it)) continue;
+            $std['items'][] = ['title' => $str($it['title_ar'] ?? ''), 'body' => $str($it['body_ar'] ?? '', 400), 'type' => $str($it['type'] ?? '', 20),
+                               'file' => http_url($it['file_url'] ?? null), 'link' => http_url($it['external_url'] ?? null),
+                               'section' => $str($it['section_ar'] ?? ''), 'date' => $str($it['created_at'] ?? '', 40)];
+        }
+        foreach (array_slice((array)($s['stats'] ?? []), 0, 12) as $st) {
+            if (is_array($st)) $std['stats'][] = ['label' => $str($st['label_ar'] ?? ''), 'value' => $str($st['value'] ?? '', 40)];
+        }
+        foreach (array_slice((array)($s['cards'] ?? []), 0, 40) as $c) {
+            if (!is_array($c)) continue;
+            $std['cards'][] = ['kind' => $str($c['kind'] ?? '', 20), 'title' => $str($c['title_ar'] ?? ''), 'file' => http_url($c['file_url'] ?? null),
+                               'date' => $str($c['date'] ?? '', 40), 'count' => is_numeric($c['count'] ?? null) ? (int)$c['count'] : null,
+                               'student' => $str($c['student_name'] ?? '')];
+        }
+        $out['standards'][] = $std;
+    }
+    return $out;
+}
+
+// جلب جديد من المنصة وحفظه في النسخة المؤقتة
+function platform_refresh(): array
+{
+    $base = get_setting('_platform_url');
+    $key  = get_setting('_platform_key');
+    if (!$base || !$key) throw new RuntimeException('الربط غير مضبوط');
+    $data = platform_shape(platform_fetch($base, $key));
+    put_setting('_platform_cache', json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    put_setting('_platform_cache_at', (string)time());
+    return $data;
+}
+
+function platform_counts(array $data): array
+{
+    $items = 0; $cards = 0;
+    foreach ($data['standards'] as $s) { $items += count($s['items']); $cards += count($s['cards']); }
+    return ['items' => $items, 'cards' => $cards];
+}
+
 function ensure_upload_dir(): void
 {
     if (!is_dir(UPLOAD_DIR) && !@mkdir(UPLOAD_DIR, 0755, true)) fail('تعذر إنشاء مجلد uploads على الخادم', 500);
@@ -586,7 +713,7 @@ function in_transaction(callable $fn): void
    ===================================================================== */
 $action = (string)($_GET['action'] ?? '');
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-if ($action !== 'load' && $method !== 'POST') fail('طريقة الطلب غير مسموحة', 405);
+if (!in_array($action, ['load', 'platform'], true) && $method !== 'POST') fail('طريقة الطلب غير مسموحة', 405);
 
 try {
     switch ($action) {
@@ -600,7 +727,60 @@ try {
                 'csrf'        => is_admin() ? $_SESSION['csrf'] : null,
                 'adminUser'   => is_admin() ? admin_credentials()['user'] : null,
                 'maxUploadMb' => MAX_UPLOAD_MB,
+                'platform'    => is_admin() ? [
+                    'url'      => get_setting('_platform_url') ?? '',
+                    'hasKey'   => (bool)get_setting('_platform_key'),
+                    'cachedAt' => (int)(get_setting('_platform_cache_at') ?? 0),
+                ] : null,
             ]);
+
+        // شواهد منصة المعلمة (للجميع) — من النسخة المؤقتة، وتُجدَّد كل 10 دقائق
+        case 'platform':
+            if (!get_setting('_platform_url') || !get_setting('_platform_key')) out(['ok' => true, 'data' => null]);
+            $cache = get_setting('_platform_cache');
+            $age = time() - (int)(get_setting('_platform_cache_at') ?? 0);
+            if ($cache && $age < PLATFORM_CACHE_SECONDS) out(['ok' => true, 'data' => json_decode($cache, true)]);
+            try {
+                out(['ok' => true, 'data' => platform_refresh()]);
+            } catch (Throwable $e) {
+                error_log('eportfolio platform: ' . $e->getMessage());
+                out(['ok' => true, 'data' => $cache ? json_decode($cache, true) : null, 'stale' => true,
+                     'error' => is_admin() ? $e->getMessage() : null]);
+            }
+
+        // حفظ رابط المنصة ومفتاح الربط ثم اختبار الاتصال
+        case 'platform_config':
+            require_admin();
+            $b = body();
+            $url = trim((string)($b['url'] ?? ''));
+            if ($url === '') {
+                del_settings(['_platform_url', '_platform_key', '_platform_cache', '_platform_cache_at']);
+                out(['ok' => true, 'disabled' => true]);
+            }
+            if (!preg_match('#^https?://[^\s<>"\']+$#i', $url)) fail('رابط المنصة غير صحيح — مثال: https://teacher.infinityfree.me');
+            $url = preg_replace('#[?\#].*$#', '', $url);
+            $url = preg_replace('#/(api\.php|index\.html?)$#i', '', rtrim($url, '/'));
+            $key = trim((string)($b['key'] ?? ''));
+            if ($key === '' && !get_setting('_platform_key')) fail('اكتب مفتاح الربط');
+            put_setting('_platform_url', $url);
+            if ($key !== '') put_setting('_platform_key', $key);
+            del_settings(['_platform_cache', '_platform_cache_at']);
+            try {
+                $data = platform_refresh();
+                out(['ok' => true, 'url' => $url, 'test' => ['ok' => true] + platform_counts($data), 'data' => $data]);
+            } catch (Throwable $e) {
+                out(['ok' => true, 'url' => $url, 'test' => ['ok' => false, 'error' => $e->getMessage()]]);
+            }
+
+        // تحديث فوري لشواهد المنصة
+        case 'platform_refresh':
+            require_admin();
+            try {
+                $data = platform_refresh();
+                out(['ok' => true, 'data' => $data, 'test' => ['ok' => true] + platform_counts($data)]);
+            } catch (Throwable $e) {
+                fail($e->getMessage());
+            }
 
         // تسجيل دخول المسؤول
         case 'login':
@@ -816,7 +996,7 @@ try {
         case 'reset':
             require_admin();
             $pdo = db();
-            $keepAuth = $pdo->query("SELECT setting_key, setting_value FROM ep_settings WHERE setting_key IN ('_admin_user', '_admin_hash')")->fetchAll(PDO::FETCH_KEY_PAIR);
+            $keepAuth = $pdo->query("SELECT setting_key, setting_value FROM ep_settings WHERE setting_key IN ('_admin_user', '_admin_hash', '_platform_url', '_platform_key')")->fetchAll(PDO::FETCH_KEY_PAIR);
             foreach (['ep_folder_items', 'ep_folder_points', 'ep_folders', 'ep_certificates', 'ep_courses', 'ep_cards', 'ep_profile', 'ep_settings'] as $t) {
                 $pdo->exec("DROP TABLE IF EXISTS $t");
             }
