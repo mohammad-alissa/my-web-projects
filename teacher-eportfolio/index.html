@@ -1389,6 +1389,20 @@
           <p class="s-hint">بعد الحفظ تُستخدم هذه البيانات بدلاً من الموجودة في config.php.</p>
         </div>
 
+        <div class="s-group server-only">
+          <h5 class="s-title"><i class="fa-solid fa-link"></i> الربط مع منصة المعلمة</h5>
+          <form id="platformForm" class="space-y-3" autocomplete="off">
+            <label class="block"><span class="s-label">رابط منصة المعلمة</span><input class="field text-sm" name="url" dir="ltr" inputmode="url" placeholder="https://teacher.infinityfree.me"></label>
+            <label class="block"><span class="s-label">مفتاح الربط <small class="text-ink-faint font-normal">(قيمة PORTFOLIO_KEY في config.php بالمنصة)</small></span><input class="field text-sm" name="key" type="password" dir="ltr" autocomplete="off"></label>
+            <p id="platformStatus" class="text-sm font-bold text-ink-muted"></p>
+            <div class="grid grid-cols-2 gap-2">
+              <button type="submit" class="btn btn-primary btn-sm"><i class="fa-solid fa-plug"></i> حفظ واختبار</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="platformRefresh"><i class="fa-solid fa-rotate"></i> تحديث الآن</button>
+            </div>
+          </form>
+          <p class="s-hint">تظهر شواهد المنصة داخل المجلد المطابق لكل معيار من معايير الأداء الثمانية، وتتحدث تلقائياً كل 10 دقائق. المفتاح يُحفظ في قاعدة البيانات ولا يظهر للزوار. لإلغاء الربط امسح الرابط واضغط حفظ.</p>
+        </div>
+
         <div class="s-group" id="storageGroup">
           <h5 class="s-title"><i class="fa-solid fa-hard-drive"></i> مساحة التخزين</h5>
           <div class="flex justify-between text-sm font-bold text-ink-2 mb-2"><span>المستخدم</span><span id="storageText">—</span></div>
@@ -1555,6 +1569,8 @@ let csrf = null;            // رمز الحماية لطلبات الكتابة
 let previewMode = false;    // معاينة المسؤول للصفحة كما يراها الزوار
 let maxUploadMb = 20;
 let adminUser = '';         // اسم مستخدم المسؤول الحالي (لتعبئة نموذج تغيير بيانات الدخول)
+let platformCfg = null;     // إعداد الربط مع منصة المعلمة (للمسؤول فقط، بدون المفتاح)
+let PLATFORM = null;        // شواهد منصة المعلمة مرتبة على معايير الأداء
 let DB = {};                // نسخة من جميع البيانات المحمّلة
 const liveBlobs = new Set();   // ملفات الوضع التجريبي المتاحة في هذه الجلسة
 const canEdit = () => isAdmin && !previewMode;
@@ -1598,6 +1614,7 @@ const serverBackend = {
   async load() {
     const d = await this.call('load', { method: 'GET' });
     isAdmin = !!d.admin; csrf = d.csrf || null; maxUploadMb = d.maxUploadMb || maxUploadMb; adminUser = d.adminUser || '';
+    platformCfg = d.platform || null;
     return d.data || {};
   },
   save(k, v) { return this.call('save', { json: { key: k, value: v } }); },
@@ -1617,7 +1634,10 @@ const serverBackend = {
     }
   },
   deleteFile(url) { return this.call('delete_file', { json: { url } }).catch(() => {}); },
-  async login(username, password) { const d = await this.call('login', { json: { username, password } }); csrf = d.csrf; isAdmin = true; adminUser = username; },
+  async login(username, password) {
+    const d = await this.call('login', { json: { username, password } }); csrf = d.csrf; isAdmin = true; adminUser = username;
+    try { platformCfg = (await this.call('load', { method: 'GET' })).platform || null; } catch {}   // إعداد الربط مع المنصة
+  },
   async logout() { await this.call('logout', { json: {} }); isAdmin = false; csrf = null; },
   reset() { return this.call('reset', { json: {} }); },
   async changeCredentials(current, username, password) { return this.call('change_credentials', { json: { current, username, password } }); },
@@ -2150,6 +2170,66 @@ const folderPct = (f) => {
   return f.points.length ? Math.round((f.points.filter(p => st.checks.includes(p)).length / f.points.length) * 100) : 0;
 };
 
+/* ===================== الربط مع منصة المعلمة =====================
+   كل معيار من معايير الأداء الثمانية في المنصة يقابله مجلد هنا */
+const STANDARD_FOLDERS = { classroom: 'class', planning: 'plan', results: 'improve', parents: 'parents', tech: 'tech', environment: 'environment', assessment: 'assessment', analysis: 'analysis' };
+const safeHref = (u) => (typeof u === 'string' && /^https?:\/\//i.test(u)) ? esc(u) : '';
+const shortDate = (v) => { const d = new Date(v); return isNaN(d) ? '' : d.toLocaleDateString('ar-SA-u-ca-gregory', { year: 'numeric', month: 'short', day: 'numeric' }); };
+
+function platformFor(folderId) {
+  const std = PLATFORM?.standards?.find(s => STANDARD_FOLDERS[s.key] === folderId);
+  return std && (std.items.length || std.stats.length || std.cards.length) ? std : null;
+}
+
+function platformItemHTML(it) {
+  const href = safeHref(it.file) || safeHref(it.link);
+  const icon = { image: 'fa-image text-violet-500', file: 'fa-file-lines text-rose-500', video: 'fa-circle-play text-red-500', link: 'fa-link text-sky-500' }[it.type] || 'fa-file-lines text-brand-500';
+  const meta = [it.section, shortDate(it.date)].filter(Boolean).map(esc).join(' · ');
+  const inner = `<i class="fa-solid ${icon} mt-1"></i><span class="min-w-0 flex-1"><span class="block font-bold text-ink-2 text-sm leading-snug">${esc(it.title || 'بدون عنوان')}</span>${meta ? `<span class="block text-xs text-ink-faint mt-0.5">${meta}</span>` : ''}</span>${href ? '<i class="fa-solid fa-arrow-up-right-from-square text-xs text-ink-faint mt-1.5"></i>' : ''}`;
+  return href ? `<li><a class="flex gap-2.5 p-2.5 rounded-xl hover:bg-brand-500/5 transition" href="${href}" target="_blank" rel="noopener">${inner}</a></li>`
+              : `<li class="flex gap-2.5 p-2.5">${inner}</li>`;
+}
+
+function platformCardHTML(c) {
+  const icon = { excellence: 'fa-star text-amber-500', certificate: 'fa-award text-emerald-500', contact_log: 'fa-comments text-sky-500' }[c.kind] || 'fa-circle text-brand-500';
+  const extra = c.kind === 'contact_log' && c.count ? ` <b class="text-brand-ink">× ${c.count}</b>` : '';
+  const who = c.student ? `<span class="block text-xs text-ink-muted">${esc(c.student)}</span>` : '';
+  const href = safeHref(c.file);
+  const body = `<i class="fa-solid ${icon} mt-0.5"></i><span class="min-w-0"><span class="block text-sm font-bold text-ink-2 leading-snug">${esc(c.title || '')}${extra}</span>${who}<span class="block text-[11px] text-ink-faint">${esc(shortDate(c.date))}</span></span>`;
+  return href ? `<a class="flex gap-2 p-2.5 rounded-xl border border-line-2 hover:border-brand-400 transition" href="${href}" target="_blank" rel="noopener">${body}</a>`
+              : `<div class="flex gap-2 p-2.5 rounded-xl border border-line-2">${body}</div>`;
+}
+
+function platformBlock(folderId) {
+  const std = platformFor(folderId);
+  if (!std) return '';
+  const SHOW = 5;
+  const items = std.items.map(platformItemHTML);
+  const cards = std.cards.map(platformCardHTML);
+  return `
+  <div class="platform-block mt-5 rounded-2xl border border-brand-300/50 bg-brand-500/[.04] p-4">
+    <div class="flex items-center gap-2 mb-3">
+      <span class="w-8 h-8 rounded-lg grid place-items-center bg-brand-600 text-white text-sm"><i class="fa-solid fa-graduation-cap"></i></span>
+      <span class="min-w-0"><span class="block font-extrabold text-ink-2 text-sm">من منصة المعلمة</span><span class="block text-[11px] text-ink-faint">${esc(std.title)} — تُحدَّث تلقائياً</span></span>
+    </div>
+    ${std.stats.length ? `<div class="flex flex-wrap gap-2 mb-3">${std.stats.map(st => `<span class="text-xs font-bold px-3 py-1.5 rounded-full bg-white/70 dark:bg-white/5 border border-line-2 text-ink-2">${esc(st.label)}: <b class="text-brand-ink">${esc(st.value)}</b></span>`).join('')}</div>` : ''}
+    ${items.length ? `<ul class="space-y-0.5">${items.slice(0, SHOW).join('')}</ul>
+      ${items.length > SHOW ? `<details class="mt-1"><summary class="cursor-pointer text-xs font-bold text-brand-ink p-2">عرض ${items.length - SHOW} شواهد أخرى</summary><ul class="space-y-0.5">${items.slice(SHOW).join('')}</ul></details>` : ''}` : ''}
+    ${cards.length ? `<div class="grid sm:grid-cols-2 gap-2 mt-3">${cards.slice(0, 6).join('')}</div>
+      ${cards.length > 6 ? `<details class="mt-1"><summary class="cursor-pointer text-xs font-bold text-brand-ink p-2">عرض ${cards.length - 6} أخرى</summary><div class="grid sm:grid-cols-2 gap-2">${cards.slice(6).join('')}</div></details>` : ''}` : ''}
+  </div>`;
+}
+
+async function loadPlatform() {
+  if (backend.kind !== 'server') return;
+  try {
+    const d = await serverBackend.call('platform', { method: 'GET' });
+    PLATFORM = d.data || null;
+    if (d.error && isAdmin) console.warn('منصة المعلمة:', d.error);
+  } catch { PLATFORM = null; }
+  renderFolders();
+}
+
 function folderHTML(f, i, isOpen) {
   const st = getFolder(f.id);
   const pct = folderPct(f);
@@ -2210,6 +2290,7 @@ function folderHTML(f, i, isOpen) {
                 <i class="fa-regular fa-hand-pointer text-brand-500 ms-1"></i> أو اسحب الملفات وأفلتها هنا <span class="text-ink-faint">(صور، Word، PDF)</span>
               </div>
               <ul class="mt-4 space-y-2" data-items></ul>
+              ${platformBlock(f.id)}
             </div>
           </div>
         </div>
@@ -2396,7 +2477,33 @@ function fillSettingsForm() {
   });
   $$('#settings [data-cvfield]').forEach(el => { el.value = cv[el.dataset.cvfield] || ''; });
   if (!$('#credForm').username.value) $('#credForm').username.value = adminUser;
+  fillPlatformForm();
   updateStorageMeter();
+}
+
+function setPlatformStatus(text, tone = 'muted') {
+  const el = $('#platformStatus');
+  el.className = 'text-sm font-bold ' + ({ ok: 'text-emerald-600', error: 'text-rose-600', muted: 'text-ink-muted' }[tone]);
+  el.textContent = text;
+}
+function fillPlatformForm() {
+  const f = $('#platformForm');
+  if (!f || !platformCfg) return;
+  if (document.activeElement !== f.url) f.url.value = platformCfg.url || '';
+  f.key.placeholder = platformCfg.hasKey ? '•••••••• (محفوظ — اتركه فارغاً للإبقاء عليه)' : 'المفتاح السري';
+  if (!platformCfg.url) setPlatformStatus('غير مربوط');
+  else if (!$('#platformStatus').textContent || $('#platformStatus').textContent === 'غير مربوط')
+    setPlatformStatus(platformCfg.cachedAt ? `مربوط — آخر تحديث ${new Date(platformCfg.cachedAt * 1000).toLocaleString('ar-SA-u-ca-gregory')}` : 'مربوط', 'ok');
+}
+function platformResult(d) {
+  if (d.disabled) { platformCfg = { url: '', hasKey: false, cachedAt: 0 }; PLATFORM = null; setPlatformStatus('تم إلغاء الربط'); renderFolders(); return; }
+  if (d.url !== undefined) platformCfg = { ...(platformCfg || {}), url: d.url, hasKey: true };
+  if (d.test?.ok) {
+    PLATFORM = d.data || PLATFORM; platformCfg.cachedAt = Math.floor(Date.now() / 1000);
+    setPlatformStatus(`✓ تم الربط — ${d.test.items} شاهد و ${d.test.cards} بطاقة`, 'ok');
+    renderFolders();
+  } else if (d.test) setPlatformStatus(d.test.error || 'تعذر الاتصال بالمنصة', 'error');
+  fillPlatformForm();
 }
 
 function renderSwatches() {
@@ -3185,6 +3292,23 @@ function bindAuthEvents() {
     finally { btn.disabled = false; }
   });
 
+  $('#platformForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target, btn = $('button[type="submit"]', f);
+    btn.disabled = true; setPlatformStatus('جارٍ الاتصال بالمنصة...');
+    try { platformResult(await serverBackend.call('platform_config', { json: { url: f.url.value.trim(), key: f.key.value.trim() } })); f.key.value = ''; }
+    catch (ex) { setPlatformStatus(ex.message, 'error'); }
+    finally { btn.disabled = false; }
+  });
+  $('#platformRefresh').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    if (!platformCfg?.url) { setPlatformStatus('اكتب رابط المنصة والمفتاح أولاً', 'error'); return; }
+    btn.disabled = true; setPlatformStatus('جارٍ التحديث...');
+    try { platformResult(await serverBackend.call('platform_refresh', { json: {} })); }
+    catch (ex) { setPlatformStatus(ex.message, 'error'); }
+    finally { btn.disabled = false; }
+  });
+
   $('#restoreInput').addEventListener('change', async (e) => {
     const file = e.target.files[0]; e.target.value = '';
     if (!file || !isAdmin) return;
@@ -3272,6 +3396,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyAccess();
   observeReveals();
   setTimeout(hidePreloader, 300);
+  loadPlatform();   // شواهد منصة المعلمة تُضاف للمجلدات حين تصل
 
   // فتح نافذة الدخول مباشرة عبر الرابط: index.html#login أو admin.html
   const wantsLogin = location.hash === '#login' || new URLSearchParams(location.search).has('login');
